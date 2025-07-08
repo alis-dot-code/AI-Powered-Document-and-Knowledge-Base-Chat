@@ -1,0 +1,159 @@
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: docmind_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-docmind}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docmind_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-docmind}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-docmind} -d ${POSTGRES_DB:-docmind}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: docmind_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_secret}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Backend (FastAPI)
+  # ---------------------------------------------------------------------------
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: docmind_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-docmind}:${POSTGRES_PASSWORD:-docmind_secret}@postgres:5432/${POSTGRES_DB:-docmind}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # Celery worker
+  # ---------------------------------------------------------------------------
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: docmind_worker
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app worker --loglevel=info --concurrency=4 -Q documents
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-docmind}:${POSTGRES_PASSWORD:-docmind_secret}@postgres:5432/${POSTGRES_DB:-docmind}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      ENVIRONMENT: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "celery", "-A", "app.workers.celery_app", "inspect", "ping", "-d", "celery@$$HOSTNAME"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
+
+  # ---------------------------------------------------------------------------
+  # Celery Beat (scheduled maintenance tasks)
+  # ---------------------------------------------------------------------------
+
+  beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: docmind_beat
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app beat --loglevel=info --schedule=/tmp/celerybeat-schedule
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-docmind}:${POSTGRES_PASSWORD:-docmind_secret}@postgres:5432/${POSTGRES_DB:-docmind}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      ENVIRONMENT: production
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Gateway (Node.js)
+  # ---------------------------------------------------------------------------
+
+  gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: docmind_gateway
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      FASTAPI_URL: http://backend:8000
+      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379/0
+      NODE_ENV: production
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # Frontend (React → nginx)
+  # ---------------------------------------------------------------------------
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3000}
+    container_name: docmind_frontend
+    restart: unless-stopped
+    depends_on:
+      gateway:
+        condition: service_healthy
+    ports:
+      - "80:80"
+
+volumes:
+  postgres_data:
+  redis_data:
